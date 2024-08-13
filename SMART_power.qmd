@@ -1,0 +1,477 @@
+---
+title: "4T Sustainnability Microrandomizad Trial"
+subtitle: "Power simulations"
+date: today
+toc: false
+number-sections: false
+format: html
+editor_options: 
+  chunk_output_type: console
+execute: 
+  echo: false
+  message: false
+  warning: false
+self-contained: true
+---
+
+## Model
+
+$$
+TIR_{ij} = \beta_0 + \gamma_i + \beta_1 tx_{ij} + \beta_2 tx_{ij} time_j + e_{ij},
+$$
+
+with
+
+$$
+\gamma_i \sim N(0, \sigma_\gamma^2), \quad e_{ij} \sim N(0, \sigma_e^2), \quad \gamma_i \perp e_{ij}
+$$
+
+Also, $TX_{i0} = 0$ since, at baseline, treatment effect is zero. The correlation between two TIRs for the same patient will be given by
+
+$$
+\rho = Cor(TIR_{ij}, TIR_{ij'}) = (1 + (\sigma_e/\sigma_\gamma)^2)^{-1}.
+$$
+
+We assume $\sigma_e = 0.1$, $\sigma_\gamma = 0.2$, such that $\rho = 0.8$
+
+
+```{r setup}
+#| echo: false
+
+library(tidyverse)
+library(lmerTest)
+library(gtsummary)
+library(gtExtras)
+library(gt)
+
+skip.streams <- function(n) {
+  x <- .Random.seed
+  for (i in seq_len(n))
+    x <- parallel::nextRNGStream(x)
+  assign('.Random.seed', x, pos=.GlobalEnv)
+}
+
+# start block
+RNGkind("L'Ecuyer-CMRG")
+set.seed(1234556)
+```
+
+
+```{r, eval=TRUE}
+N = c(100)
+B = 2000
+
+dt_aux0 <- lapply(N, \(x){
+  expand_grid(r = 1:B, pid = 1:x) %>% 
+    mutate(sample_size = x)
+}) %>% bind_rows()
+
+skip.streams(10)
+dt_aux <- dt_aux0 %>% 
+  group_split(sample_size, r, pid) %>% 
+  parallel::mclapply(\(x) {
+    dt <- data.frame(
+      sample_size = x$sample_size[1],
+      r = x$r[1],
+      pid = x$pid[1],
+      
+      study_week = 13:52,
+      treatment = sample(c('Addon', 'Default'), 1))
+    
+    bind_rows(
+      dt %>% mutate(set = "A", sd_g = .20, sd_e = .20/2, b3 = .005),
+      dt %>% mutate(set = "B", sd_g = .16, sd_e = .16/2, b3 = .005),
+      dt %>% mutate(set = "C", sd_g = .20, sd_e = .20/2, b3 = 0)) %>%
+      group_by(set) %>% 
+      mutate(
+        time = study_week - 13,
+        tide_week = (study_week - 12 + sample(1:4, 1) - 1) %% 4 + 1,
+        
+        gamma = rnorm(1, 0, sd_g^2),
+        error = rnorm(length(study_week), 0, sd_e^2),
+        trt = as.numeric(treatment == 'Addon'),
+        TIR = .75 + gamma - .005*time + b3*time*trt + error) %>% 
+      ungroup()
+  }, mc.cores = 10, mc.set.seed = T) %>%
+  bind_rows() %>%
+  filter(tide_week <= 2)
+
+# dt_aux %>% 
+#   filter(r==1) %>% 
+#   ggplot(aes(y = factor(time), x = TIR, fill = treatment)) + 
+#   ggridges::geom_density_ridges(alpha = .5, rel_min_height = 0.01, scale = .7) +
+#   geom_vline(xintercept = 1, linetype = 'dashed', linewidth = 1) +
+#   facet_wrap(vars(set), ncol = 2) +
+#   coord_flip() +
+#   scale_fill_brewer(palette = 'Set1') +
+#   labs(x = 'Time (weeks after microrandomization start)',
+#        y = '% of time-in-range',
+#        fill = 'Treatment regimen') +
+#   theme_bw() +
+#   theme(legend.position = 'top')
+```
+
+
+```{r, eval=TRUE}
+skip.streams(10)
+
+dt_sim <- dt_aux %>% 
+  group_split(sample_size, set, r, b3, .keep = T) %>% 
+  parallel::mclapply(\(x) {
+    lmer(TIR ~ time + time*trt + (1|pid), data = x) %>%
+      broom.mixed::tidy() %>%
+      mutate(
+        sample_size = x$sample_size[1],
+        set = x$set[1],
+        r = x$r[1],
+        b3 = x$b3[1],
+        n = length(unique(x$pid)))
+  }, mc.cores  = 10, mc.set.seed = T) %>% bind_rows()
+
+dt_sim %>% 
+  filter(term == 'time:trt') %>% 
+  group_by(sample_size, set) %>% 
+  mutate(bias = estimate - b3,
+         mse = bias^2,
+         empirical_stderr = estimate - mean(estimate, na.rm = T),
+         prop_rej = as.numeric(p.value < 0.05),
+         ll = estimate - 1.96*std.error,#/sqrt(n),
+         ul = estimate + 1.96*std.error,#/sqrt(n),
+         cover = as.numeric((ll <= b3)*(b3 <= ul))) %>% 
+  summarise(across(c(bias, empirical_stderr, mse, cover, prop_rej),
+                   ~ mean(., na.rm = T)), .groups = 'drop')
+
+# # A tibble: 3 × 7
+#   sample_size set           bias empirical_stderr      mse cover prop_rej
+#         <dbl> <chr>        <dbl>            <dbl>    <dbl> <dbl>    <dbl>
+# 1         100 A     -0.00000875         -1.25e-19 1.56e- 9  0.95     1   
+# 2         100 B      0.000000907        -2.26e-19 5.67e-10  0.97     1   
+# 3         100 C     -0.000000448        -1.76e-21 1.79e- 9  0.92     0.08
+```
+
+
+
+
+
+
+```{r}
+# Setup the data structure for all pts
+N = c(50, 100, 200)
+B = 2
+
+dt0 <- lapply(N, \(x){
+  expand_grid(r = 1:B, pid = 1:x) %>% 
+    mutate(sample_size = x)
+}) %>% bind_rows()
+
+dt <- dt0 %>% 
+  group_split(sample_size, r, pid) %>% 
+  parallel::mclapply(\(x) {
+    dt <- data.frame(
+      sample_size = x$sample_size[1],
+      r = x$r[1],
+      pid = x$pid[1],
+      # 1-year follow up
+      study_week = 13:52)
+    
+    bind_rows(
+      dt %>% mutate(set = "A", sd_g = .20, sd_e = .20/2, b3 = .005),
+      dt %>% mutate(set = "B", sd_g = .16, sd_e = .16/2, b3 = .005),
+      dt %>% mutate(set = "C", sd_g = .20, sd_e = .20/2, b3 = 0)) %>%
+      group_by(set) %>% 
+      mutate(
+        time = study_week - 13,
+        # tide week of the month
+        # randomly assigned starting tide week
+        tide_week = (study_week - 12 + sample(1:4, 1) - 1) %% 4 + 1,
+        # RMP happens at tide week 1 by default?
+        default_rpm = as.numeric(tide_week == 1),
+        # counter for number of RPMs
+        default_rpm_nbr = cumsum(default_rpm)*default_rpm,
+        
+        # randomize only at weeks following the default RMP week
+        rand_week = lag(default_rpm, default = 0),
+        rand_week_nbr = cumsum(rand_week)*rand_week,
+        
+        gamma = rnorm(1, 0, sd_g^2),
+        error = rnorm(length(study_week), 0, sd_e^2)) %>% 
+      ungroup()
+  }, mc.cores = 10, mc.set.seed = T) %>%
+  bind_rows() %>%
+  # only need tide weeks 1 and 2
+  filter(tide_week <= 2)
+```
+
+
+```{r}
+# n <- 100
+# 
+# dt0 <- lapply(1:n, \(x) {
+#   data.frame(
+#     pid = x,
+#     # One your of follow up
+#     study_week = 13:52) %>%
+#     mutate(
+#       time = study_week - 13,
+#       # tide week of the month
+#       # randomly assigned starting tide week
+#       tide_week = (1:40 + sample(1:4, 1) - 1) %% 4 + 1,
+#       # RMP happens at tide week 1 by default?
+#       default_rpm = as.numeric(tide_week == 1),
+#       # counter for number of RPMs
+#       default_rpm_nbr = cumsum(default_rpm)*default_rpm,
+#       
+#       # randomize only at weeks following the default RMP week
+#       rand_week = lag(default_rpm, default = 0),
+#       rand_week_nbr = cumsum(rand_week)*rand_week,
+#       
+#       gamma = rnorm(1, 0, .2^2),
+#       error = rnorm(length(study_week), 0, .1^2))
+# }) %>%
+#   bind_rows() %>%
+#   as_tibble()
+# 
+# 
+# dt <- dt0 %>%
+#   filter(tide_week <= 2)
+```
+
+```{r}
+# Set first RMP week to default treatment and generate TIR data
+dt <- dt %>% filter(sample_size == 100, r == 1, set == 'A')
+
+skip.streams(10)
+
+# simulate_4t <- function(dt) {
+  dt <- dt %>% 
+    mutate(treatment = ifelse(default_rpm_nbr == 1, 'Default', NA),
+           trt = as.numeric(treatment == 'Addon'),
+           TIR = .75 + gamma - .005*time + b3*time*trt + error,
+           # TIR = ifelse(default_rpm_nbr == 1, runif(nrow(.)), NA),
+           at_risk = as.numeric(TIR < .65),
+           randomized = NA) %>% 
+    arrange(pid, time)
+  
+  dt_rule <- dt %>% 
+    group_by(time) %>% 
+    summarise(
+      n_risk = sum(at_risk, na.rm = T),
+      n_trt = sum(treatment == 'Addon', na.rm = T)) %>% 
+    mutate(
+      capacity = 10,
+      rand_rule = as.numeric(n_risk < 2*capacity) + 1)
+
+for (k in 1:39) {
+    # k = 1
+    # print(k)
+    
+    # Assign treatment to those at risk
+    current_rule <- dt_rule %>% filter(time == k-1) %>% with(rand_rule)
+    current_cap <- dt_rule %>% filter(time == k-1) %>% with(capacity)
+    current_risk <- dt_rule %>% filter(time == k-1) %>% with(n_risk)
+    
+    idx <- which(dt$time == k-1 & dt$at_risk == 1)
+    aux_ids <- dt$pid[idx]
+    
+    if (current_rule == 1) {
+      aux_trt <- sample(c(rep('Addon', current_capa),
+                          rep('Default', current_risk - current_cap)))
+    }
+    
+    if (current_rule == 2) {
+      aux_trt <- sample(c(rep('Addon', ceiling(current_risk/2)),
+                          rep('Default', floor(current_risk/2))))
+    }
+    
+    subset_ids <- dt %>% filter(time == k) %>% with(pid)
+    
+    dt_new <- dt %>% 
+      filter(pid %in% subset_ids, time <= k) %>% 
+      arrange(desc(time)) %>% 
+      group_split(pid) %>% 
+      lapply(\(x) {
+        last_complete <- min(which(!is.na(x[,'treatment'])))
+        
+        if (last_complete > 1) {
+          if (x[1, 'rand_week'] == 0) {
+            x[1, 'treatment'] <- x[last_complete, 'treatment']
+            x[1, 'randomized'] <- 0
+          } else {
+            if (x[last_complete, 'at_risk'] == 1) {
+              # Assign randomized treatment
+              x[1, 'treatment'] <- aux_trt[which(x$pid[1] == aux_ids)]
+              x[1, 'randomized'] <- 1
+            }
+          }
+        }
+        return(x)
+      }) %>%
+      bind_rows()
+    
+    dt_new <- dt_new %>% 
+      mutate(
+        trt = as.numeric(treatment == 'Addon'),
+        TIR = .75 + gamma - .005*time + b3*time*trt + error,
+        # TIR = ifelse(!is.na(treatment), runif(nrow(.)), NA),
+        at_risk = as.numeric(TIR < .65))
+    
+    dt <- dt %>%
+      filter(pid %in% subset_ids, time > k) %>%
+      bind_rows(dt %>% filter(!(pid %in% subset_ids))) %>%
+      bind_rows(dt_new) %>%
+      arrange(pid, time)
+    
+    # update rules table
+    dt_rule <- dt %>% 
+      group_by(time) %>% 
+      summarise(
+        n_risk = sum(at_risk, na.rm = T),
+        n_trt = sum(treatment == 'Addon', na.rm = T)) %>% 
+      mutate(
+        capacity = 10,
+        rand_rule = as.numeric(n_risk < 2*capacity) + 1)
+  }
+  
+  view(dt_rule)
+  view(dt)
+```
+
+
+```{r}
+# return(list(dt = dt, dt_rule = dt_rule))
+# }
+
+list_sim <- simulate_4t(dt)
+
+list_sim$dt %>% 
+  filter(tide_week == 2, !is.na(randomized))
+
+list_sim$dt_rule
+```
+
+
+```{r}
+dt %>%
+  # filter(time == 1, tide_week == 1, at_risk == 0) %>%
+  # filter(time == 1) %>%
+  filter(pid == 10, time <= 11) %>% 
+  print(n=20, width = Inf)
+
+```
+
+
+
+```{r}
+dt <- dt %>% 
+  mutate(treatment = ifelse(default_rpm_nbr == 1, 'Default', NA),
+         trt = as.numeric(treatment == 'Addon'),
+         TIR = .75 + gamma - .005*time + b3*time*trt + error,
+         # TIR = ifelse(default_rpm_nbr == 1, runif(nrow(.)), NA),
+         at_risk = as.numeric(TIR < .65),
+         randomized = NA) %>% 
+  arrange(pid, time)
+
+dt_rule <- dt %>% 
+  group_by(time) %>% 
+  summarise(
+    n_risk = sum(at_risk, na.rm = T),
+    n_trt = sum(treatment == 'Addon', na.rm = T)) %>% 
+  mutate(
+    capacity = 10,
+    rand_rule = as.numeric(n_risk < 2*capacity) + 1)
+```
+
+```{r}
+for (k in 1:39) {
+  # k = 1
+  # print(k)
+  
+  # Assign treatment to those at risk
+  current_rule <- dt_rule %>% filter(time == k-1) %>% with(rand_rule)
+  current_cap <- dt_rule %>% filter(time == k-1) %>% with(capacity)
+  current_risk <- dt_rule %>% filter(time == k-1) %>% with(n_risk)
+  
+  idx <- which(dt$time == k-1 & dt$at_risk == 1)
+  aux_ids <- dt$pid[idx]
+  
+  if (current_rule == 1) {
+    aux_trt <- sample(c(rep('Addon', current_capa),
+                        rep('Default', current_risk - current_cap)))
+  }
+  
+  if (current_rule == 2) {
+    aux_trt <- sample(c(rep('Addon', ceiling(current_risk/2)),
+                        rep('Default', floor(current_risk/2))))
+  }
+  
+  subset_ids <- dt %>% filter(time == k) %>% with(pid)
+  
+  dt_new <- dt %>% 
+    filter(pid %in% subset_ids, time <= k) %>% 
+    arrange(desc(time)) %>% 
+    group_split(pid) %>% 
+    lapply(\(x) {
+      last_complete <- min(which(!is.na(x[,'treatment'])))
+      
+      if (last_complete > 1) {
+        if (x[1, 'rand_week'] == 0) {
+          x[1, 'treatment'] <- x[last_complete, 'treatment']
+          x[1, 'randomized'] <- 0
+        } else {
+          if (x[last_complete, 'at_risk'] == 1) {
+            # Assign randomized treatment
+            x[1, 'treatment'] <- aux_trt[which(x$pid[1] == aux_ids)]
+            x[1, 'randomized'] <- 1
+          }
+        }
+      }
+      return(x)
+    }) %>%
+    bind_rows()
+  
+  dt_new <- dt_new %>% 
+    mutate(
+      trt = as.numeric(treatment == 'Addon'),
+      TIR = .75 + gamma - .005*time + b3*time*trt + error,
+      # TIR = ifelse(!is.na(treatment), runif(nrow(.)), NA),
+      at_risk = as.numeric(TIR < .65))
+  
+  dt <- dt %>%
+    filter(pid %in% subset_ids, time > k) %>%
+    bind_rows(dt %>% filter(!(pid %in% subset_ids))) %>%
+    bind_rows(dt_new) %>%
+    arrange(pid, time)
+  
+  # update rules table
+  dt_rule <- dt %>% 
+    group_by(time) %>% 
+    summarise(
+      n_risk = sum(at_risk, na.rm = T),
+      n_trt = sum(treatment == 'Addon', na.rm = T)) %>% 
+    mutate(
+      capacity = 10,
+      rand_rule = as.numeric(n_risk < 2*capacity) + 1)
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

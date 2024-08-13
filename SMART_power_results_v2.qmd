@@ -1,0 +1,510 @@
+---
+title: "4T Sustainnability Microrandomizad Trial"
+subtitle: "Power simulations"
+date: today
+toc: false
+number-sections: false
+format: html
+editor_options: 
+  chunk_output_type: console
+execute: 
+  echo: false
+  message: false
+  warning: false
+self-contained: true
+---
+
+```{r setup}
+#| echo: false
+
+library(tidyverse)
+library(lmerTest)
+library(gtsummary)
+library(gtExtras)
+library(gt)
+library(DT)
+
+skip.seed.streams <- function(n) {
+  x <- .Random.seed
+  for (i in seq_len(n))
+    x <- parallel::nextRNGStream(x)
+  assign('.Random.seed', x, pos=.GlobalEnv)
+}
+
+# start block
+RNGkind("L'Ecuyer-CMRG")
+set.seed(274546)
+
+sim_4t_microrand <- function(N, capacity = Inf, return_dt_sim = FALSE) {
+  # N: scaler or vector of sample sizes to be simulated
+  
+  dt_aux0 <- lapply(N, \(x){
+    data.frame(sample_size = x, pid = 1:x)
+  }) %>% bind_rows()
+  
+  # Generate baseline data
+  dt_aux <- dt_aux0 %>% 
+    group_split(sample_size, pid) %>% 
+    lapply(\(x) {
+      dt <- data.frame(
+        sample_size = x$sample_size[1],
+        pid = x$pid[1],
+        study_week = 13:52)
+      
+      bind_rows(
+        dt %>% mutate(set = "A", sd_g = .20, sd_e = .20/2, b3 = .005),
+        dt %>% mutate(set = "B", sd_g = .16, sd_e = .16/2, b3 = .005),
+        dt %>% mutate(set = "C", sd_g = .20, sd_e = .20/2, b3 = 0)) %>%
+        group_by(set) %>% 
+        mutate(
+          time = study_week - 13,
+          tide_week = (study_week - 12 + sample(1:4, 1) - 1) %% 4 + 1,
+          
+          gamma = rnorm(1, 0, sd_g^2),
+          error = rnorm(length(study_week), 0, sd_e^2),
+          
+          treatment = 'Default',
+          TIR = .75 + gamma - .005*time + error,
+          iter = cumsum(as.numeric(tide_week == 1)),
+          rand = 0) %>% 
+        ungroup()
+    }) %>%
+    bind_rows() %>%
+    filter(tide_week <= 2)
+  
+  # Iterate study week
+  dt_sim <- dt_aux %>% 
+    group_split(sample_size, set) %>% 
+    lapply(\(x) {
+      aux_risk <- x %>% 
+        filter(tide_week == 1, TIR < .65) 
+      
+      if (nrow(aux_risk) == 0) return()
+      
+      min_k <- min(aux_risk$iter)
+      dt_iter <- x
+      for (k in min_k:10) {
+        dt_iter <- dt_iter %>% 
+          mutate(
+            elig = ifelse(tide_week == 1, as.numeric(TIR < .65), NA),
+            rand_trt = ifelse((iter == k)*elig == 1, sample(c(0, 1), nrow(.), replace = T), NA)) %>% 
+          group_by(pid) %>% 
+          mutate(
+            rand_trt = ifelse(is.na(rand_trt), '', rand_trt),
+            rand_trt = paste0(lag(rand_trt, n = 1, default = ''),
+                              lag(rand_trt, n = 2, default = '')),
+            rand_trt = ifelse(rand_trt == '', NA, as.numeric(rand_trt))) %>%
+          ungroup() %>%
+          mutate(
+            rand = rand + as.numeric(!is.na(rand_trt)),
+            treatment = ifelse(!is.na(rand_trt) & rand_trt == 1, 'Addon', treatment),
+            rand_TIR = .75 + gamma - .005*time + b3*time*rand_trt + error,
+            TIR = ifelse(!is.na(rand_trt) & rand_trt == 1, rand_TIR, TIR))
+        
+        # print(dt_iter, n=100)
+      }
+      
+      dt_iter %>%
+        mutate(
+          sample_size = x$sample_size[1],
+          set = x$set[1],
+          rand_trt = NULL,
+          rand_TIR = NULL) %>% 
+        filter(iter > 1, tide_week == 1, rand == 1)
+    }) %>%
+    bind_rows()
+  
+  # Impose capacity
+  if (is.finite(capacity)) {
+    dt_sim <- dt_sim %>% 
+      # filter(sample_size==200, set=='B', time == 38) %>% 
+      arrange(sample_size, set, time, treatment) %>% 
+      group_by(sample_size, set, time) %>% 
+      mutate(
+        addon_cum = cumsum(as.numeric(treatment == 'Addon')),
+        addon_cum = ifelse(treatment == 'Addon', addon_cum, NA)) %>% 
+      ungroup() %>% 
+      mutate(
+        exceed_cap = ifelse(addon_cum > capacity, 1, 0),
+        treatment = ifelse(!is.na(exceed_cap) & exceed_cap == 1, 'Default', treatment),
+        TIR = ifelse(!is.na(exceed_cap) & exceed_cap == 1, .75 + gamma - .005*time + error, TIR)) %>% 
+      arrange(sample_size, set, pid, time)
+  }
+  
+  # Summary
+  dt_summ <- dt_sim %>% 
+    count(sample_size, set, time, treatment) %>% 
+    pivot_wider(names_from = treatment, values_from = n) %>% 
+    mutate(across(where(is.numeric), ~ ifelse(is.na(.), 0, .)),
+           atRisk = Addon + Default)
+
+  if(return_dt_sim) return(dt_sim)
+  
+  # Fit LMM
+  dt_reg <- dt_sim %>% 
+    mutate(trt = as.numeric(treatment == 'Addon')) %>% 
+    nest_by(sample_size, set, b3) %>% 
+    mutate(
+      n_clust = length(unique(data$pid)),
+      n_obs = nrow(data),
+      mod = lmer(TIR ~ time + time*trt + (1|pid), data = data) %>% list()) %>% 
+    reframe(n_clust, n_obs,
+            broom.mixed::tidy(mod) %>%
+              filter(term == 'time:trt') %>% 
+              select(-group))
+  
+  return(list(lmer_reg = dt_reg, summary = dt_summ))
+}
+```
+
+## Model
+
+$$
+TIR_{ij} = \beta_0 + \gamma_i + \beta_1 Trt_{ij} + \beta_2 Time_{ij} + \beta_3 Trt_{ij} Time_j + e_{ij},
+$$
+
+with
+
+$$
+\gamma_i \sim N(0, \sigma_\gamma^2), \quad e_{ij} \sim N(0, \sigma_e^2), \quad \gamma_i \perp e_{ij}
+$$
+
+Also, $\beta_1 = 0$ since, at baseline, the treatment effect is zero. The correlation between two TIRs for the same patient will be given by
+
+$$
+\rho = Cor(TIR_{ij}, TIR_{ij'}) = (1 + (\sigma_e/\sigma_\gamma)^2)^{-1}.
+$$
+
+In all simulated scenarios, we fixed $\sigma_e/\sigma_\gamma = 0.5$, such that $\rho = 0.8$. Also, we assume a baseline TIR before microrandomization of $\beta_0 = 0.75$ and a baseline time trend of $\beta_2 = -0.005$ as patients get progressively worse TIR if not intervened.
+
+Thus, using sample sizes of **25**, **50**, **100**, and **200**, we simulate
+
+$$
+TIR_{ij} = .75 + \gamma_i - 0.005 Time_{ij} + \beta_3 Trt_{ij} Time_j + e_{ij},
+$$
+
+under the following scenarios
+
+**Scenarios A1-A5**
+
+-   $\beta_1 = 0.005, 0.0025, 0.001, 0.0005, 0.0001$
+-   $\sigma_e = 0.1$ and $\sigma_\gamma = 0.2$
+
+**Scenarios B1-B5**
+
+-   $\beta_1 = 0.005, 0.0025, 0.001, 0.0005, 0.0001$
+-   $\sigma_e = 0.08$ and $\sigma_\gamma = 0.16$
+
+**Scenarios C1-C2**
+
+-   $\beta_1 = 0$
+-   C1: $\sigma_e = 0.1$ and $\sigma_\gamma = 0.2$
+-   C2: $\sigma_e = 0.08$ and $\sigma_\gamma = 0.16$
+
+@fig-rct has data from a non-microrandomized sample of size 100, *i.e.*, patients simply randomized to default or add-on treatment at baseline.
+
+```{r}
+#| cache: true
+#| fig-height: 8
+#| fig-width: 8
+#| label: fig-rct
+#| fig-cap: data for a randomized (single randomization at baseline, not microrandomized) sample of 100 patients.
+
+N = 100
+
+dt_gg <- lapply(N, \(x){
+  expand_grid(pid = 1:x) %>% 
+    mutate(sample_size = x)
+}) %>% bind_rows()
+
+dt_gg <- dt_gg %>% 
+  group_split(sample_size, pid) %>% 
+  parallel::mclapply(\(x) {
+    dt <- data.frame(
+      sample_size = x$sample_size[1],
+      pid = x$pid[1],
+      
+      study_week = 13:52,
+      treatment = sample(c('Addon', 'Default'), 1))
+    
+    bind_rows(
+      dt %>% mutate(set = "A1", sd_g = .20, sd_e = .20/2, b3 = .005),
+      dt %>% mutate(set = "B1", sd_g = .16, sd_e = .16/2, b3 = .005),
+      dt %>% mutate(set = "C1", sd_g = .20, sd_e = .20/2, b3 = 0)) %>%
+      group_by(set) %>% 
+      mutate(
+        time = study_week - 13,
+        tide_week = (study_week - 12 + sample(1:4, 1) - 1) %% 4 + 1,
+        
+        gamma = rnorm(1, 0, sd_g^2),
+        error = rnorm(length(study_week), 0, sd_e^2),
+        trt = as.numeric(treatment == 'Addon'),
+        TIR = .75 + gamma - .005*time + b3*time*trt + error) %>% 
+      ungroup()
+  }, mc.cores = 10, mc.set.seed = T) %>%
+  bind_rows() %>%
+  filter(tide_week <= 2)
+
+dt_gg %>%
+  ggplot(aes(y = factor(time), x = TIR, fill = treatment)) +
+  ggridges::geom_density_ridges(alpha = .5, rel_min_height = 0.01, scale = .7) +
+  geom_vline(xintercept = 1, linetype = 'dashed', linewidth = 1) +
+  facet_wrap(vars(set), ncol = 1) +
+  coord_flip() +
+  scale_fill_brewer(palette = 'Set1') +
+  labs(y = 'Time (weeks after microrandomization start)',
+       x = '% of time-in-range',
+       fill = 'Treatment regimen') +
+  theme_bw() +
+  theme(legend.position = 'top')
+```
+
+## Simulation results
+
+The results below were obtained using $B = 2000$ replications of the scenarios described above.
+
+```{r}
+list_reg_all <- readRDS("list_reg_all_B2000_cap10_v3.rds")
+
+dt_reg_all <- lapply(list_reg_all, '[[', 1) %>% bind_rows()
+dt_risk_all <- lapply(list_reg_all, '[[', 2) %>% bind_rows()
+# saveRDS(list_reg_all, 'list_reg_all_B200_cap10.rds')
+```
+
+```{r}
+#| fig-height: 5
+#| fig-width: 8
+#| label: fig-capacity
+#| fig-cap: average number of participants at risk and add-on treatment provided over the study weeks
+
+myCols <- c(colorRampPalette(c("#bdc9e1", "#034e7b"))(5),
+            colorRampPalette(c("#fdcc8a", "#990000"))(5),
+            colorRampPalette(c("#31a354", "#006d2c"))(2))
+
+dt_risk_all %>% 
+  group_by(sample_size, set, time) %>% 
+  summarise(across(c(Default, Addon, atRisk),
+                   list(m = mean, sd = sd)), .groups = 'drop') %>% 
+  select(sample_size, set, time,
+         `Avg. # addon RPM` = Addon_m,
+         `Avg. # at risk` = atRisk_m) %>% 
+  mutate(sample_size = factor(sample_size, levels = unique(sample_size) %>% sort()),
+         sample_size = fct_relabel(sample_size, ~ glue::glue('n = {.x}'))) %>% 
+  pivot_longer(-c(sample_size, set, time)) %>% 
+  ggplot(aes(x = time, y = value, color = set, linetype = name)) +
+  geom_hline(yintercept = 10, linetype = 'dashed') +
+  annotate('text', x = 10, y = 12, label = 'capacity') +
+  geom_line(linewidth = .5, alpha = .7) +
+  scale_x_continuous(limits = c(1,39)) +
+  scale_color_manual(values = myCols) +
+  labs(x = 'Time (weeks) since micro-randomization start',
+       y = 'Average number of patients at risk',
+       color = 'Scenario',
+       linetype = '') +
+  facet_wrap(~ sample_size, nrow = 1) +
+  theme_bw() +
+  guides(color = guide_legend(ncol=6)) +
+  theme(legend.position = 'top',
+        legend.byrow = T)
+```
+
+```{r}
+# compute metrics
+dt_res <- dt_reg_all %>% 
+  filter(term == 'time:trt') %>% 
+  group_by(sample_size, set, up_to_time) %>% 
+  add_count(name = 'n_boot') %>% 
+  mutate(bias = estimate - b3,
+         mse = bias^2,
+         empirical_stderr = estimate - mean(estimate, na.rm = T),
+         prop_rej = as.numeric(p.value < 0.05),
+         ll = estimate - 1.96*std.error,#/sqrt(n),
+         ul = estimate + 1.96*std.error,#/sqrt(n),
+         cover = as.numeric((ll <= b3)*(b3 <= ul))) %>% 
+  summarise(across(c(n_boot, n_obs, n_clust, bias, empirical_stderr, mse, cover, prop_rej),
+                   ~ mean(., na.rm = T)), .groups = 'drop')
+```
+
+```{r}
+#| fig-height: 8
+#| fig-width: 10
+#| eval: false
+
+aux_b_tir <- c('20%','10%','4%','2%','1%')
+
+dt_res %>% 
+  filter(n_boot >= 50) %>% 
+  filter(str_detect(set, 'C', negate = T)) %>%
+  # filter(str_detect(set, 'A')) %>% 
+  mutate(set_group = glue::glue('Scenario {str_sub(set, 1, 1)}'),
+         set_nbr = factor(str_sub(set, 2, 2), labels = aux_b_tir),
+         # set_nbr = fct_relabel(set_nbr, aux_b_tir),
+         sample_size = factor(sample_size, levels = unique(sample_size) %>% sort()),
+         sample_size = fct_relabel(sample_size, ~ glue::glue('n = {.x}'))) %>% 
+  ggplot(aes(x = n_obs, y = prop_rej, color = set_nbr, linetype = set_group)) +
+  geom_point() +
+  geom_line() +
+  geom_hline(yintercept = .8, linewidth = .5, linetype = 'dashed') +
+  facet_wrap(~ sample_size, ncol = 2) +
+  scale_color_brewer(palette = 'Dark2') +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = 'Average (cumulative) number of micro-randomization opportunities',
+       y = 'Power',
+       color = 'Expected difference in TIR at end of study',
+       linetype = '') +
+  theme_bw() +
+  theme(legend.position = 'top')
+```
+
+```{r}
+#| fig-height: 8
+#| fig-width: 10
+
+aux_b_tir <- c('20%','10%','4%','2%','1%')
+aux_b_tir <- paste0(aux_b_tir, ' difference in TIR')
+
+dt_res %>% 
+  filter(n_boot >= 50) %>% 
+  filter(str_detect(set, 'C', negate = T)) %>%
+  # filter(str_detect(set, 'A')) %>% 
+  mutate(set_group = glue::glue('Scenario {str_sub(set, 1, 1)}'),
+         set_nbr = factor(str_sub(set, 2, 2), labels = aux_b_tir),
+         # set_nbr = fct_relabel(set_nbr, aux_b_tir),
+         sample_size = factor(sample_size, levels = unique(sample_size) %>% sort()),
+         # sample_size = fct_relabel(sample_size, ~ glue::glue('n = {.x}'))
+         ) %>% 
+  ggplot(aes(x = n_obs, y = prop_rej, color = sample_size, linetype = set_group)) +
+  geom_point() +
+  geom_line() +
+  geom_hline(yintercept = .8, linewidth = .5, linetype = 'dashed') +
+  facet_wrap(~ set_nbr, ncol = 5) +
+  scale_color_brewer(palette = 'Dark2') +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = 'Average number of micro-randomization opportunities',
+       y = 'Power',
+       color = 'Sample size',
+       linetype = '') +
+  theme_bw() +
+  theme(legend.position = 'top')
+```
+
+```{r}
+#| fig-height: 8
+#| fig-width: 10
+aux_b_tir <- c('20%','10%','4%','2%','1%')
+
+dt_res %>% 
+  filter(n_boot >= 50) %>% 
+  filter(str_detect(set, 'C', negate = T)) %>%
+  # filter(str_detect(set, 'A')) %>% 
+  mutate(set_group = glue::glue('Scenario {str_sub(set, 1, 1)}'),
+         set_nbr = factor(str_sub(set, 2, 2), labels = aux_b_tir),
+         # set_nbr = fct_relabel(set_nbr, aux_b_tir),
+         sample_size = factor(sample_size, levels = unique(sample_size) %>% sort()),
+         sample_size = fct_relabel(sample_size, ~ glue::glue('Capacity/n ratio: 10/{.x}'))) %>% 
+  ggplot(aes(x = up_to_time, y = prop_rej, color = set_nbr, linetype = set_group)) +
+  geom_point() +
+  geom_line() +
+  geom_hline(yintercept = .8, linewidth = .5, linetype = 'dashed') +
+  facet_wrap(~ sample_size, nrow = 2) +
+  scale_color_brewer(palette = 'Dark2') +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = seq(8, 40, 8)) +
+  labs(x = 'Time (weeks) since micro-randomization start',
+       y = 'Power',
+       color = 'Expected difference in TIR at end of study',
+       linetype = '') +
+  theme_bw() +
+  theme(legend.position = 'top')
+```
+
+```{r}
+#| fig-height: 8
+#| fig-width: 10
+aux_b_tir <- c('20%','10%','4%','2%','1%')
+
+dt_res %>% 
+  filter(n_boot >= 50) %>% 
+  filter(str_detect(set, 'C', negate = T)) %>% 
+  filter(up_to_time > 8) %>%
+  mutate(set_group = str_sub(set, 1, 1),
+         set_group = if_else(up_to_time <= 24, ifelse(set_group == 'A', 'B', 'A'), set_group),
+         set_group = glue::glue('Scenario {set_group}'),
+         set_nbr = factor(str_sub(set, 2, 2), labels = aux_b_tir),
+         # set_nbr = fct_relabel(set_nbr, aux_b_tir),
+         # sample_size = factor(sample_size, levels = unique(sample_size) %>% sort())
+         # sample_size = fct_relabel(sample_size, ~ glue::glue('Capacity/n ratio: 10/{.x}'))
+         up_to_time = factor(up_to_time, levels = unique(up_to_time) %>% sort()),
+         up_to_time = fct_relabel(up_to_time, ~ glue::glue('{.x} weeks of micro-randomization'))
+         ) %>% 
+  ggplot(aes(x = sample_size, y = prop_rej, color = set_nbr, linetype = set_group)) +
+  geom_point() +
+  geom_line() +
+  geom_hline(yintercept = .8, linewidth = .5, linetype = 'dashed') +
+  facet_wrap(~ up_to_time, nrow = 2) +
+  scale_color_brewer(palette = 'Set1') +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = unique(dt_res$sample_size),
+                     labels = glue::glue('10/{unique(dt_res$sample_size)}')) +
+  labs(x = 'Capacity/sample size ratio',
+       y = 'Power',
+       color = 'Expected difference in TIR at end of study',
+       linetype = '') +
+  theme_bw() +
+  theme(legend.position = 'top')
+```
+
+<!-- ![](images/Screenshot.png) -->
+
+```{r}
+aux_b_tir <- c('20%','10%','4%','2%','1%')
+
+dt_res %>% 
+  filter(up_to_time == 40) %>% 
+  mutate(set_group = glue::glue('Scenario {str_sub(set, 1, 1)}'),
+         set_nbr = factor(str_sub(set, 2, 2), labels = aux_b_tir)) %>% 
+  ggplot(aes(x = sample_size, y = prop_rej, color = set_nbr, linetype = set_group)) +
+  geom_point() +
+  geom_line(linewidth = .8) +
+  # geom_hline(yintercept = .8, linewidth = .5, linetype = 'dashed') +
+  scale_color_brewer(palette = 'Set1') +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = sort(unique(dt_res$sample_size))) +
+  labs(x = 'Sample size',
+       y = 'Power',
+       color = 'Expected difference in TIR',
+       linetype = '') +
+  theme_bw() +
+  theme(legend.position = 'right')
+```
+
+```{r}
+#| tbl-cap: (suplementary table) complete simulation results
+#| label: tbl-supp
+
+generate_datatable = function(data, cols_highlight){
+  data %>%
+    datatable(
+      # colnames = as.vector(unlist(dt_var_label)),
+      filter = "top",
+      extensions = 'Buttons',
+      options = list(
+        pageLength = 50, 
+        dom = 'Bfrtip',
+        scrollX = TRUE,
+        buttons = c('copy', 'csv', 'excel', 'pdf', 'print'))) %>%
+    formatPercentage(c("cover", "power"), 2) %>% 
+    formatStyle(
+      columns = cols_highlight,
+      backgroundColor = '#E0E0E0')
+}
+
+dt_res %>% 
+  filter(up_to_time == 40) %>% 
+  select(set, sample_size, cover, power = prop_rej) %>% 
+  arrange(set, sample_size) %>% 
+  generate_datatable(cols_highlight = 'power')
+  # gt() %>% 
+  # fmt_number(n_sigfig = 3) %>% 
+  # gt_theme_guardian()
+```
